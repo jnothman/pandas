@@ -20,6 +20,7 @@ from pandas.core.frame import DataFrame
 from pandas.core.sparse.api import SparseDataFrame, SparseSeries
 from pandas.core.sparse.array import SparseArray
 from pandas._libs.sparse import IntIndex
+from pandas._libs.sparse import BlockIndex, get_blocks
 
 from pandas.core.categorical import Categorical, _factorize_from_iterable
 from pandas.core.sorting import (get_group_index, get_compressed_ids,
@@ -173,30 +174,66 @@ class _Unstacker(object):
         self.compressor = comp_index.searchsorted(np.arange(ngroups))
 
     def get_result(self):
-        # TODO: find a better way than this masking business
-
-        values, value_mask = self.get_new_values()
-        columns = self.get_new_columns()
         index = self.get_new_index()
 
+        cols = self.sorted_labels[-1]
+        if self.lift:
+            cols = cols + self.lift
+        rows = self.group_index
+        assert np.all(np.diff(rows) >= 0)
+
+        values = self.sorted_values
+        # if our mask is all True, then we can use our existing dtype
+        if len(values) == np.prod(self.full_shape):
+            dtype = values.dtype
+            fill_value = self.fill_value
+        else:
+            dtype, fill_value = maybe_promote(values.dtype,
+                                              self.fill_value)
+        rows = np.asarray(rows, dtype=np.int32)
+        cols = np.asarray(cols, dtype=np.int32)
+        out = np.empty((values.shape[1], self.full_shape[1]), dtype='O')
+        for col, col_rows in Series(rows, copy=False).groupby(cols):
+            # FIXME: shouldn't col be used somewhere?
+            # get_blocks expects int32 rows indices in sorted order
+            # but rows should already be sorted
+            # rowvals = rowvals.sort_index()
+            blocs, blens = get_blocks(np.asarray(col_rows, dtype=np.int32))
+            for i in range(values.shape[1]):
+                ss = SparseSeries(values[col_rows.index, i].astype(dtype), index=index,
+                                  fill_value=fill_value,
+                                  sparse_index=BlockIndex(len(index), blocs, blens))
+                out[i, col] = ss
+
+        columns = self.get_new_columns()
+
         # filter out missing levels
-        if values.shape[1] > 0:
+        if self.full_shape[1] > 0:
             col_inds, obs_ids = compress_group_index(self.sorted_labels[-1])
             # rare case, level values not observed
             if len(obs_ids) < self.full_shape[1]:
-                inds = (value_mask.sum(0) > 0).nonzero()[0]
-                values = algos.take_nd(values, inds, axis=1)
-                columns = columns[inds]
+                # FIXME: this can't be working for values.shape[1] > 1?
+                col_mask = np.zeros(out.shape[1], dtype=bool)
+                col_mask[cols] = True
+                out = out[:, col_mask]
+                columns = columns[col_mask]
+
+        out = out.ravel()
 
         # may need to coerce categoricals here
         if self.is_categorical is not None:
             categories = self.is_categorical.categories
             ordered = self.is_categorical.ordered
-            values = [Categorical(values[:, i], categories=categories,
-                                  ordered=ordered)
-                      for i in range(values.shape[-1])]
+            # TODO: Sparse Categorical??
+            out = [Categorical(out_col, categories=categories,
+                               ordered=ordered)
+                   for out_col in out]
 
-        return self.constructor(values, index=index, columns=columns)
+        # FIXME: which constructor
+###        return self.constructor(values, index=index, columns=columns)
+        out = {name: out_col for name, out_col in zip(columns, out)}
+        return SparseDataFrame(out, index=index, columns=columns,
+                               default_fill_value=fill_value).to_dense()
 
     def get_new_values(self):
         values = self.values
